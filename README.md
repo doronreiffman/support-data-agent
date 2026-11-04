@@ -145,4 +145,6 @@ python scripts/test_mcp.py        # starts the MCP server; filter_by_intent then
 
 Started as Assignment 3 of my Nebius Academy course (AI Performance Engineering, 2026).
 
+This repository was recreated on 4 November 2026; its commit history carried over unchanged.
+
 Built by Doron Reiffman ([LinkedIn](https://www.linkedin.com/in/doronreiffman)).
