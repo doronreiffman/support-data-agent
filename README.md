@@ -64,8 +64,8 @@ Prerequisites:
 Run everything from the repository root, the folder that holds `main.py`:
 
 ```bash
-git clone https://github.com/doronreiffman/Reiffman-Assignment3-Bitext-Agent.git
-cd Reiffman-Assignment3-Bitext-Agent
+git clone https://github.com/doronreiffman/support-data-agent.git
+cd support-data-agent
 
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
