@@ -1,141 +1,117 @@
-# Bitext Customer Service Data Analyst Agent
+# Customer Support Data Analyst Agent
 
-Assignment 3 — LangGraph ReAct agent over the [Bitext customer support dataset](https://huggingface.co/datasets/bitext/Bitext-customer-support-llm-chatbot-training-dataset). Tasks 1–3 plus bonuses (Streamlit UI, query recommender) are implemented.
+A LangGraph agent that answers plain-English questions about the [Bitext customer support dataset](https://huggingface.co/datasets/bitext/Bitext-customer-support-llm-chatbot-training-dataset): 26,872 customer messages with agent replies, tagged with 11 categories and 27 intents. It is for an analyst who wants counts, examples, intent breakdowns or summaries without writing pandas: the agent works each answer out with tool calls over the data and shows every step, in a terminal or a Streamlit chat. The same tools are also served to any MCP client.
 
-## Prerequisites
+## What it shows
 
-- **Python 3.10 or newer** (the code uses `X | None` type syntax from PEP 604). Check with `python3 --version`.
-- A **Nebius Token Factory** API key — see [Model](#model) for where to get one.
-- **Internet access on first run** to download the dataset (no Hugging Face account or token required — the dataset is public).
+- **Agent loop and routing:** a LangGraph `StateGraph` where an LLM router labels each question (structured, unstructured, out of scope, profile) before any tool runs, then a hand-built ReAct loop of model and tool calls, capped at 12 steps.
+- **Tool calling:** eight LangChain tools over a pandas view of the dataset (list, filter, count, sample, intent counts), with Pydantic input schemas; filters chain within a turn.
+- **Memory:** per-session chat history in SQLite checkpoints that survive restarts, plus a per-user profile the LLM distills after each in-scope turn and keeps in its own file.
+- **MCP server:** FastMCP over stdio exposes seven of the tools to any MCP client (Claude Desktop, Cursor, Claude Code).
+- **UI:** a Streamlit chat and a CLI, both showing the router's decision, each tool call and its result next to the answer.
+- **Query recommender:** suggests a next question from the conversation and profile, and runs it only after you say yes.
+- **Tests:** an offline regression test for cross-turn filter state, plus smoke scripts for the tools, routing, memory and the MCP server.
 
-## Setup (under 5 minutes)
-
-All commands below run from the **repository root** — the folder that contains `main.py` (not a `bitext-agent/` subfolder).
-
-```bash
-# 1. Get the code (skip if you already have it). The folder is named after the repo.
-git clone https://github.com/doronreiffman/Reiffman-Assignment3-Bitext-Agent.git
-cd Reiffman-Assignment3-Bitext-Agent   # or: cd <whatever you named the clone>
-
-# 2. Create and activate a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate               # Windows: .venv\Scripts\activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Add your API key
-cp .env.example .env
-# Open .env and set NEBIUS_API_KEY=...
-
-# 5. Run
-python main.py
-```
-
-> On Windows, or if `python3` isn't found, use `python` instead. After the venv is activated, `python` already points at the right interpreter.
-
-First run downloads ~27k rows from Hugging Face and caches them under `data/bitext.parquet`; later runs load from that cache.
-
-## CLI
-
-```bash
-python main.py
-python main.py --session alice
-python main.py --session alice --user alice
-```
-
-- `--session` — LangGraph `thread_id`; same value restores conversation after restart (`data/checkpoints.sqlite`).
-- `--user` — profile file under `data/profiles/` (defaults to `--session`).
-
-Interactive loop. Type `quit` to exit. The CLI prints:
-
-- Router decision (`structured` / `unstructured` / `out_of_scope`)
-- Each tool call and observation
-- Final answer
-
-### Session memory (Task 2a)
-
-Follows the course notebook pattern ([agent_memory.ipynb](../agent_memory.ipynb)): compile with a checkpointer, pass only the **new** user message each turn, reuse `thread_id` via `--session`. We use **SqliteSaver** instead of `MemorySaver` so state survives restarts.
-
-Example:
-
-```text
-You: How many complaints are in the dataset?
-…
-You: What about refunds?
-```
-
-### User profile (Task 2b)
-
-Distilled facts (name, interests) live in `data/profiles/<user>.json`, separate from chat checkpoints. Updated after each in-scope turn. Ask: *What do you remember about me?*
-
-## Model
-
-**`meta-llama/Llama-3.3-70B-Instruct`** via [Nebius Token Factory](https://api.tokenfactory.nebius.com/v1/).
-
-Create an API key in the Nebius Token Factory console and set it in `.env` as `NEBIUS_API_KEY` (see [Setup](#setup-under-5-minutes)).
-
-Same model for both routing and the ReAct agent. We tried smaller models (Gemma 3 27B) but tool-calling was unreliable — the model would skip filter steps or hallucinate tool names. Llama 3.3 70B handled multi-step chains (filter → count) correctly and is a good cost/quality tradeoff.
-
-## Architecture
+## How a question flows
 
 ```mermaid
 flowchart TD
-    start([User query]) --> router[router_node]
-    router -->|out_of_scope| decline[decline_node]
-    router -->|structured or unstructured| agent[react_agent]
-    agent --> tools[tool_node]
+    q([Question]) --> prepare["prepare: clear the filter"]
+    prepare --> router{"router"}
+    router -->|out_of_scope| decline["decline: fixed reply"]
+    router -->|profile| profile["profile: read the saved profile"]
+    router -->|structured or unstructured| agent["agent: Llama 3.3 70B with tools bound"]
+    agent -->|tool call| tools["tools: run on the dataset view"]
     tools --> agent
-    agent -->|final answer| endNode([END])
-    decline --> endNode
+    agent -->|12 steps used| limit["limit: fallback reply"]
+    agent -->|answer| done([Answer])
+    decline --> done
+    profile --> done
+    limit --> done
 ```
 
-1. **Router** — classifies the query before any tools run. Out-of-scope questions get a fixed decline (no general knowledge).
-2. **ReAct agent** — Nebius LLM with tools; max **12** agent steps, then a fallback message.
-3. **Tools** — composable filters and queries over the dataset.
+The graph is in `src/graph.py`. Around it, `src/agent_runner.py` handles the query recommender before a turn and updates the user profile after it; the CLI and the Streamlit app both go through it.
 
-**Filter state:** `filter_by_*` tools narrow a working view (row IDs in `working_row_ids`) so multi-step chains within a turn (`filter → count`) share the same filter. Filter state is **turn-scoped** — it resets at the start of each turn. For follow-ups like “show me 3 more” or “what about refunds?”, the agent re-applies the relevant filter from the conversation history (preserved by the checkpointer); this keeps switching topics from intersecting a stale filter down to zero rows.
-
-## Tools
-
-| Tool | Purpose |
-|------|---------|
+| Tool | What it does |
+|------|--------------|
 | `list_categories` | All category names |
-| `list_intents` | Intent names, optional category filter |
-| `filter_by_category` | Restrict working view to a category |
-| `filter_by_intent` | Restrict working view to an intent |
-| `reset_filters` | Clear filters |
-| `count_rows` | Row count in current view |
-| `sample_examples` | Random instruction/response pairs |
-| `intent_distribution` | Intent counts in current view |
+| `list_intents` | Intent names, optionally for one category |
+| `filter_by_category` | Narrow the working view to a category |
+| `filter_by_intent` | Narrow the working view to an intent |
+| `reset_filters` | Back to the full dataset |
+| `count_rows` | Rows in the current view |
+| `sample_examples` | Random instruction/response pairs (up to 20) |
+| `intent_distribution` | Intent counts in the current view |
 
-Multi-step example: `filter_by_intent("get_refund")` → `count_rows()`.
+## Examples
 
-## MCP server (Task 3)
+**"How many refund requests did we get?"** The router labels it `structured`. The system prompt says never to guess numbers and to filter before counting, so the expected chain is `filter_by_intent("get_refund")`, then `count_rows()`, and the answer carries the count. Over MCP the same two calls return 997 (`scripts/test_mcp.py`).
 
-Expose dataset tools via [FastMCP](https://gofastmcp.com/) for any MCP client (Claude Desktop, Cursor, Claude Code, etc.).
+**"Who is the president of France?"** The router labels it `out_of_scope` (`scripts/smoke_test.py` checks this) and no tool runs. The reply is fixed in `src/graph.py`:
 
-### Start the server
+> I can only answer questions about the Bitext customer support dataset (categories, intents, counts, examples, and summaries of that data). I can't help with that question.
+
+Others to try: *What categories exist in the dataset?* *Show me 5 examples of the SHIPPING category.* *Summarize how agents respond to complaint intents.* *What is the distribution of intents in the ACCOUNT category?*
+
+## Run it
+
+Prerequisites:
+
+- Python 3.10 or newer (the code uses `X | None` type syntax). Check with `python3 --version`.
+- A Nebius Token Factory API key, created in the Token Factory console.
+- Internet access on the first run, to download the dataset. No Hugging Face account or token is needed; the dataset is public.
+
+Run everything from the repository root, the folder that holds `main.py`:
 
 ```bash
-python mcp_server.py
+git clone https://github.com/doronreiffman/Reiffman-Assignment3-Bitext-Agent.git
+cd Reiffman-Assignment3-Bitext-Agent
+
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env               # then set NEBIUS_API_KEY=... in .env
+python main.py
 ```
 
-Or with the FastMCP CLI:
+On Windows, or if `python3` isn't found, use `python`; inside the activated venv, `python` is the right interpreter. The first run downloads the dataset from Hugging Face and caches it at `data/bitext.parquet`; later runs load the cache.
+
+### CLI
 
 ```bash
-fastmcp run mcp_server.py
+python main.py                           # session "default"
+python main.py --session alice           # resume or start session "alice"
+python main.py --session alice --user alice
 ```
 
-The server uses **stdio** transport (default): the client spawns this process and talks over stdin/stdout. The dataset is loaded once at startup.
+- `--session` is the LangGraph `thread_id`. The same value restores the conversation after a restart (stored in `data/checkpoints.sqlite`).
+- `--user` picks the profile file under `data/profiles/` and defaults to the `--session` value.
 
-**Exposed tools (7):** `list_categories`, `list_intents`, `filter_by_category`, `filter_by_intent`, `count_rows`, `sample_examples`, `intent_distribution`.
+The CLI prints the router decision, each tool call and observation, and the final answer. Type `quit` to exit.
 
-Stateful filters work within one MCP session: call `filter_by_intent` then `count_rows` (same as the CLI agent).
+In the chat, in the CLI or in Streamlit:
 
-### Connect from an MCP client
+- *What do you remember about me?* answers from your saved profile (`data/profiles/<user>.json`).
+- *What should I query next?* suggests one query without running it. Refine it (*"I'd rather see examples instead"*), or reply *yes*, *go ahead* or *do it* to run it.
 
-Most MCP clients share the same `mcpServers` config block — add this server to your client's MCP configuration:
+### Streamlit
+
+```bash
+streamlit run streamlit_app.py
+```
+
+A chat with a "Reasoning steps" expander (router, tool calls, observations) under each answer. The sidebar's Session ID and User ID work like `--session` and `--user`.
+
+### MCP server
+
+```bash
+python mcp_server.py        # or: fastmcp run mcp_server.py
+```
+
+It uses stdio: the client starts this process and talks over stdin and stdout. It exposes `list_categories`, `list_intents`, `filter_by_category`, `filter_by_intent`, `count_rows`, `sample_examples` and `intent_distribution`. The server keeps one working view while it runs, so filters carry from call to call (`filter_by_intent`, then `count_rows`); `reset_filters` is not exposed over MCP.
+
+Add it to your client's `mcpServers` config, with the absolute path to your clone (run `pwd` in it; on Windows the interpreter is `.venv\Scripts\python.exe`), then reload the client:
 
 ```json
 {
@@ -148,53 +124,25 @@ Most MCP clients share the same `mcpServers` config block — add this server to
 }
 ```
 
-Replace `/absolute/path/to/repo` with the absolute path to your repository root (run `pwd` there to get it; on Windows use `.venv\Scripts\python.exe`), then restart/reload the client so it picks up the server. Where this config lives depends on the client:
+Where the config lives: Claude Desktop, `claude_desktop_config.json` (Settings, Developer, Edit Config); Cursor, `.cursor/mcp.json` or Settings, MCP; Claude Code, `claude mcp add` or a project `.mcp.json`; other clients, their MCP docs. Then ask the client's model to use `list_categories`.
 
-- **Claude Desktop** — `claude_desktop_config.json` (Settings → Developer → Edit Config)
-- **Cursor** — `.cursor/mcp.json` or Settings → MCP
-- **Claude Code** — `claude mcp add …` or a project `.mcp.json`
-- **Other clients** (Windsurf, etc.) — see the client's MCP docs for where its config lives
-
-### Example: call one tool
-
-In your MCP client's chat (with the server enabled), ask the model to use the `list_categories` tool.
-
-Or test from the terminal:
+### Tests
 
 ```bash
-python scripts/test_mcp.py
+python scripts/test_followup.py   # no API key: every turn starts from a clean filter
+python scripts/smoke_test.py      # tools offline; routing and a multi-step query with a key
+python scripts/test_memory.py     # profile file; session memory with a key
+python scripts/test_mcp.py        # starts the MCP server; filter_by_intent then count_rows gives 997
 ```
 
-Manual chain example:
+## Design notes
 
-1. `filter_by_intent` with `intent="get_refund"`
-2. `count_rows` → should return `997`
+- **Model:** `meta-llama/Llama-3.3-70B-Instruct` on Nebius Token Factory, at temperature 0, for routing, the agent, profile updates and suggestions. Gemma 3 27B was tried first, and its tool calling was unreliable: it skipped filter steps or made up tool names. Llama 3.3 70B handled multi-step chains (filter, then count) correctly and is a good cost and quality tradeoff.
+- **Route before tools:** a short classification call (150 max tokens) runs first, so out-of-scope questions get a fixed decline and never draw on general knowledge. Structured and unstructured questions get different system prompts: filter and count, or filter and sample 10 to 15 examples to summarize. The agent itself gets 1,024 tokens; 150 cut summaries short.
+- **One tool call at a time:** tools are bound with `parallel_tool_calls=False`, so the model sees a filter's result before it counts or samples.
+- **Turn-scoped filters:** `filter_by_*` narrows a working view of row IDs so a chain within one turn shares it. An earlier version carried the filter into the next turn, so "How many complaints?" then "What about refunds?" returned 0: a row has one intent, and the two filters intersected to nothing. Matching follow-up phrases could not cover every wording, so now every turn starts from the full dataset and the agent re-applies a filter from the chat history when a follow-up needs it. `scripts/test_followup.py` checks five phrasings.
+- **Two kinds of memory:** chat history lives in LangGraph checkpoints, with `SqliteSaver` instead of `MemorySaver` so it survives restarts; each turn passes only the new message. Durable facts (name, interests) live in a separate profile file that the LLM rewrites after each in-scope turn, kept under 8 bullet points.
 
-## Bonus A — Streamlit UI
+Started as Assignment 3 of my Nebius Academy course (AI Performance Engineering, 2026).
 
-```bash
-streamlit run streamlit_app.py
-```
-
-- Chat interface with assistant responses
-- **Reasoning steps** expander (router, tool calls, observations)
-- **Sidebar:** Session ID and User ID (same semantics as CLI `--session` / `--user`)
-
-## Bonus B — Query recommender
-
-Ask: *What should I query next?* (also in the CLI)
-
-1. Agent **suggests** a follow-up query — does **not** run it yet
-2. You can refine (*"I'd rather see examples instead"*)
-3. Reply **yes** / **go ahead** / **do it** to execute the suggested query
-
-Works in both `streamlit run streamlit_app.py` and `python main.py`.
-
-## Example queries
-
-- What categories exist in the dataset?
-- How many refund requests did we get?
-- Show me 5 examples of the SHIPPING category.
-- Summarize how agents respond to complaint intents.
-- What is the distribution of intents in the ACCOUNT category?
-- Who is the president of France? (out-of-scope)
+Built by Doron Reiffman ([LinkedIn](https://www.linkedin.com/in/doronreiffman)).
