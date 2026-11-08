@@ -148,3 +148,5 @@ Started as Assignment 3 of my Nebius Academy course (AI Performance Engineering,
 This repository was recreated on 4 November 2026; its commit history carried over unchanged.
 
 Built by Doron Reiffman ([LinkedIn](https://www.linkedin.com/in/doronreiffman)).
+
+[![M8ven Score](https://m8ven.ai/badge/mcp/doronreiffman-support-data-agent-1nq811?v=0d0ed83494d77cdb1773368d829ce143)](https://m8ven.ai/mcp/doronreiffman-support-data-agent-1nq811?s=readme)
